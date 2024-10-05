@@ -1,7 +1,7 @@
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import smtplib
-from flask import Flask, request
+from flask import Flask, request, render_template, send_from_directory
 from flask_cors import CORS
 import os
 from dotenv import load_dotenv
