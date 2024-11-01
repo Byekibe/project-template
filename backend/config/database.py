@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import mysql.connector
 
@@ -15,9 +16,17 @@ logger.addHandler(handler)
 # Also log to a file
 file_handler = logging.FileHandler("cpy-errors.log")
 file_handler.setFormatter(formatter)
-logger.addHandler(file_handler) 
+logger.addHandler(file_handler)
 
-def connect_to_mysql(config, attempts=3, delay=2):
+config = {
+    'user': os.getenv('MY_MYSQL_MODERN_USER_TODAY'),
+    'database': os.getenv('MY_MYSQL_MODERN_DB'),
+    'port': os.getenv('MY_MYSQL_PORT'),
+    'host': os.getenv('MY_MYSQL_MODERN_HOST'),
+    'password': os.getenv('MY_MYSQL_MODERN_PASSWORD')
+}
+
+def get_db_connection(config=config, attempts=3, delay=2):
     attempt = 1
     # Implement a reconnection routine
     while attempt < attempts + 1:
