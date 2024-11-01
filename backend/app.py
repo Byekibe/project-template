@@ -11,6 +11,8 @@ from flask_bcrypt import Bcrypt
 from flask_jwt_extended import (
     create_access_token, create_refresh_token, JWTManager, get_jwt_identity, jwt_required, get_jwt
 )
+from email_validator import validate_email, EmailNotValidError  # To validate emails
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 
 load_dotenv()
 
@@ -28,6 +30,7 @@ password = os.getenv('password_mail')
 
 # First, let's add a token blocklist set in memory for additional security
 blocklist = set()
+s = URLSafeTimedSerializer(app.config['JWT_SECRET_KEY'])
 
 # Callback to check if the token is in the blocklist
 # Add this callback to log token checks (for debugging)
@@ -283,6 +286,84 @@ def logout():
         print(f"Logout error: {e}")
         return jsonify(msg="Error during logout", error=str(e)), 500
 
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route('/api/forgot-password', methods=['POST'])
+def forgot_password():
+    data = request.get_json()
+    email = data.get('email')
+
+    # Validate the email format (you already have regex/email-validator)
+    try:
+        valid = validate_email(email)
+        email = valid.email
+    except EmailNotValidError as e:
+        return jsonify({'message': str(e)}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+    user = cursor.fetchone()
+
+    if not user:
+        return jsonify({'message': 'Email not found'}), 404
+
+    # Generate reset token with an expiration time
+    token = s.dumps(email, salt='password-reset-salt')
+
+    # Create password reset URL
+    reset_url = f"http://localhost:5173/reset-password/{token}"  # Adapt this URL to your frontend route
+
+    # Send the reset email
+    msg = MIMEMultipart()
+    msg['To'] = email
+    msg['Subject'] = "Password Reset Request"
+    msg['From'] = my_email
+    body = f"Please click the link to reset your password: {reset_url}"
+    msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587) as connection:
+            connection.starttls()
+            connection.login(my_email, password)
+            connection.sendmail(my_email, email, msg.as_string())
+        print("Password reset email sent successfully!")
+    except Exception as e:
+        return jsonify({'error': 'Failed to send reset email'}), 500
+
+    return jsonify({'message': 'Password reset email sent!'}), 200
+
+
+@app.route('/api/reset-password', methods=['POST'])
+def reset_password():
+    data = request.get_json()
+    token = data.get('token')
+    new_password = data.get('newPassword')
+
+    try:
+        # Verify the reset token (1-hour expiration)
+        email = s.loads(token, salt='password-reset-salt', max_age=3600)
+    except SignatureExpired:
+        return jsonify({'message': 'The reset token has expired'}), 400
+    except BadSignature:
+        return jsonify({'message': 'Invalid token'}), 400
+
+    # Hash the new password
+    hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Update the user's password
+        cursor.execute("UPDATE users SET password = %s WHERE email = %s", (hashed_password, email))
+        conn.commit()
+        return jsonify({'message': 'Password reset successful'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'message': f"Error resetting password: {str(e)}"}), 500
     finally:
         cursor.close()
         conn.close()
