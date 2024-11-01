@@ -31,28 +31,23 @@ blocklist = set()
 
 # Callback to check if the token is in the blocklist
 # Add this callback to log token checks (for debugging)
+# Callback function to check if a JWT exists in the database blocklist
+# Callback function to check if a JWT exists in the database blocklist
 @jwt.token_in_blocklist_loader
 def check_if_token_revoked(jwt_header, jwt_payload: dict) -> bool:
     jti = jwt_payload["jti"]
-    token_type = jwt_payload["type"]
     
-    # Check both memory blocklist and database
-    if jti in blocklist:
-        print(f"Token found in memory blocklist - JTI: {jti}, Type: {token_type}")
-        return True
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute('SELECT created_at FROM token_blocklist WHERE jti = %s', (jti,))
-        result = cursor.fetchone()
-        is_revoked = result is not None
-        print(f"Database check - JTI: {jti}, Type: {token_type}, Revoked: {is_revoked}")
-        return is_revoked
-    finally:
-        cursor.close()
-        conn.close()
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    query = "SELECT id FROM token_blocklist WHERE jti = %s"
+    cursor.execute(query, (jti,))
+    result = cursor.fetchone()
+
+    cursor.close()
+    connection.close()
+
+    return result is not None
 
 
 @app.route('/', defaults={'path': ''})
@@ -176,21 +171,24 @@ def login():
         conn.close()
 
 
-# Refresh token
-# Modify your refresh endpoint to check for revoked tokens
+# Refresh token route
 @app.route("/api/refresh", methods=["POST"])
 @jwt_required(refresh=True)
 def refresh():
     current_user_id = get_jwt_identity()
     token = get_jwt()
     jti = token["jti"]
+    iat = token["iat"]  # Extract the "issued at" timestamp from the token
     
-    print(f"Refresh attempt - User: {current_user_id}, JTI: {jti}")
+    print(f"Refresh attempt - User: {current_user_id}, JTI: {jti}, Issued At: {iat}")
     
     conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
+        # Convert 'iat' to a datetime object in UTC
+        token_issued_at = datetime.fromtimestamp(iat, tz=timezone.utc)
+        
         # Check if user has logged out since this refresh token was issued
         cursor.execute('''
             SELECT EXISTS(
@@ -198,7 +196,7 @@ def refresh():
                 WHERE user_id = %s 
                 AND logout_time > %s
             ) as has_logged_out
-        ''', (current_user_id, datetime.now(timezone.utc) - app.config["JWT_REFRESH_TOKEN_EXPIRES"]))
+        ''', (current_user_id, token_issued_at))  # Compare against the token issuance time
         
         has_logged_out = cursor.fetchone()[0]
         
@@ -206,17 +204,18 @@ def refresh():
             print(f"User {current_user_id} has logged out since refresh token was issued")
             return jsonify({"msg": "Token has been revoked"}), 401
             
+        # Check if the token is in memory blocklist
         if jti in blocklist:
             print(f"Token {jti} found in memory blocklist")
             return jsonify({"msg": "Token has been revoked"}), 401
-            
-        # Check database blocklist
+        
+        # Check if the token is in the database blocklist
         cursor.execute('SELECT 1 FROM token_blocklist WHERE jti = %s', (jti,))
         if cursor.fetchone():
             print(f"Token {jti} found in database blocklist")
             return jsonify({"msg": "Token has been revoked"}), 401
         
-        # If we get here, token is valid
+        # If we get here, token is valid, generate new access token
         access_token = create_access_token(identity=current_user_id)
         return jsonify(access_token=access_token)
         
@@ -224,32 +223,35 @@ def refresh():
         cursor.close()
         conn.close()
 
-# Logout functionality
+
+
+
+# Endpoint for revoking both access and refresh tokens
 @app.route("/api/logout", methods=["DELETE"])
 @jwt_required(verify_type=False)
 def logout():
     token = get_jwt()
     jti = token["jti"]
-    ttype = token["type"]
+    ttype = token["type"]  # Access or refresh
     user_id = get_jwt_identity()
     now = datetime.now(timezone.utc)
-    
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     try:
-        # Add to memory blocklist
+        # 1. Add current token to memory blocklist
         blocklist.add(jti)
-        
-        # Revoke the current token
+
+        # 2. Add the current token (access or refresh) to the database blocklist
         cursor.execute(
             'INSERT INTO token_blocklist (jti, type, created_at, user_id) VALUES (%s, %s, %s, %s)',
             (jti, ttype, now, user_id)
         )
-        
-        # If it's an access token, also invalidate the refresh token
+
+        # 3. If it's an access token, also try to revoke the refresh token
         if ttype == "access":
-            # Get the authorization header
+            # Extract the refresh token from the custom header (or handle this on the frontend)
             auth_header = request.headers.get('X-Refresh-Token')
             if auth_header and auth_header.startswith('Bearer '):
                 refresh_token = auth_header.split(' ')[1]
@@ -257,8 +259,8 @@ def logout():
                     # Decode the refresh token to get its JTI
                     decoded_token = jwt.decode_token(refresh_token)
                     refresh_jti = decoded_token["jti"]
-                    
-                    # Add refresh token to blocklist
+
+                    # Add the refresh token to memory and database blocklist
                     blocklist.add(refresh_jti)
                     cursor.execute(
                         'INSERT INTO token_blocklist (jti, type, created_at, user_id) VALUES (%s, %s, %s, %s)',
@@ -266,22 +268,25 @@ def logout():
                     )
                 except Exception as e:
                     print(f"Error processing refresh token: {e}")
-            
-            # Record the logout
+
+            # Record the logout in the user_sessions table
             cursor.execute(
                 'INSERT INTO user_sessions (user_id, logout_time) VALUES (%s, %s)',
                 (user_id, now)
             )
-        
+
         conn.commit()
         return jsonify(msg=f"Logged out successfully. Token type: {ttype}"), 200
+
     except Exception as e:
         conn.rollback()
         print(f"Logout error: {e}")
         return jsonify(msg="Error during logout", error=str(e)), 500
+
     finally:
         cursor.close()
         conn.close()
+
 
 # ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::End of authentication:::::::::::::::::::::::::::::::::::::::::::::
 
